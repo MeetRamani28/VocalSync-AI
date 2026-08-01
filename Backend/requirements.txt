@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+websockets
+python-multipart
+pydantic
+pydantic-settings
+email-validator
+motor
+groq
+langchain-core
+langchain-groq
+edge-tts
+slowapi
+python-dotenv
+httpx
