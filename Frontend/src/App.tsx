@@ -1,287 +1,286 @@
-import React, { useState, useEffect, useCallback } from "react";
-import {
-  Sparkles,
-  PhoneCall,
-  Activity,
-  ShieldCheck,
-  BarChart3,
-  CheckCircle2,
-  AlertCircle,
-  RefreshCw,
-} from "lucide-react";
-import { useAudioRecorder } from "./hooks/useAudioRecorder";
-import { useWebSocketVoice } from "./hooks/useWebSocketVoice";
-import { apiService } from "./services/api";
-import type { AnalyticsSummary } from "./types";
-import { AudioVisualizer } from "./components/AudioVisualizer";
-import { CallControls } from "./components/CallControls";
-import { TranscriptFeed } from "./components/TranscriptFeed";
-import { LeadAnalyticsCard } from "./components/LeadAnalyticsCard";
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useAudioRecorder } from './hooks/useAudioRecorder';
+import { useWebSocketVoice } from './hooks/useWebSocketVoice';
+import { apiService } from './services/api';
+import { BusinessProfile, SystemHealth } from './types';
+
+// UI Components
+import { AudioVisualizer } from './components/AudioVisualizer';
+import { CallControls } from './components/CallControls';
+import { TranscriptFeed } from './components/TranscriptFeed';
+import { LeadAnalyticsCard } from './components/LeadAnalyticsCard';
+import { BusinessConfigModal } from './components/BusinessConfigModal';
+import { OutboundDialerCard } from './components/OutboundDialerCard';
 
 export const App: React.FC = () => {
-  const [callId, setCallId] = useState<string>("");
-  const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null);
-  const [isBackendHealthy, setIsBackendHealthy] = useState<boolean | null>(
-    null,
-  );
-  const [isRefreshingAnalytics, setIsRefreshingAnalytics] =
-    useState<boolean>(false);
+  const [activeCallId, setActiveCallId] = useState<string | null>(null);
+  const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
+  const [businessProfile, setBusinessProfile] = useState<BusinessProfile | null>(null);
+  const [isKbModalOpen, setIsKbModalOpen] = useState<boolean>(false);
+  const [callMode, setCallMode] = useState<'browser' | 'pstn'>('browser');
 
+  const animationFrameRef = useRef<number | null>(null);
+  const [visualizerData, setVisualizerData] = useState<Uint8Array | null>(null);
+
+  // Initialize Voice WebSocket Hook
   const {
     isConnected,
-    agentState,
+    agentStatus,
     transcripts,
-    latestToken,
-    qualifiedLead,
-    errorMessage: wsError,
-    connect,
-    disconnect,
+    liveLead,
+    connectWebSocket,
+    disconnectWebSocket,
     sendAudioChunk,
-    clearError,
+    error: wsError,
   } = useWebSocketVoice();
 
+  // Initialize Microphone Recording Hook (with RMS Noise Gate)
   const {
     isRecording,
     startRecording,
     stopRecording,
     getFrequencyData,
-    error: audioError,
+    error: micError,
   } = useAudioRecorder({
-    onAudioChunkAvailable: sendAudioChunk,
-    timeSliceMs: 250,
+    onAudioChunkAvailable: async (blob: Blob) => {
+      await sendAudioChunk(blob);
+    },
+    timeSliceMs: 1000,
+    silenceThresholdDb: -50,
   });
 
-  const handleStartCall = useCallback(async () => {
-    clearError();
-    const newCallId = `call_${crypto.randomUUID()}`;
-    setCallId(newCallId);
-
-    try {
-      connect(newCallId);
-      await startRecording();
-    } catch (err) {
-      console.error("Failed to start voice call session:", err);
-    }
-  }, [clearError, connect, startRecording]);
-
-  const fetchAnalytics = useCallback(async () => {
-    setIsRefreshingAnalytics(true);
-    try {
-      const summary = await apiService.getAnalyticsSummary();
-      setAnalytics(summary);
-    } catch (err) {
-      console.error("Failed to fetch analytics summary:", err);
-    } finally {
-      setIsRefreshingAnalytics(false);
-    }
-  }, []);
-
-  const handleEndCall = useCallback(() => {
-    stopRecording();
-    disconnect();
-    void fetchAnalytics();
-  }, [stopRecording, disconnect, fetchAnalytics]);
-
+  // Load System Health & Default Business KB on mount
   useEffect(() => {
-    const checkSystemReady = async () => {
+    const initApp = async () => {
       try {
-        const health = await apiService.checkHealth();
-        setIsBackendHealthy(health.database_connected);
-        await fetchAnalytics();
+        const [health, profile] = await Promise.all([
+          apiService.getHealth(),
+          apiService.getBusinessProfile('default_business').catch(() => null),
+        ]);
+        setSystemHealth(health);
+        if (profile) setBusinessProfile(profile);
       } catch (err) {
-        console.error("Backend unreachable:", err);
-        setIsBackendHealthy(false);
+        console.error('Failed to initialize application data:', err);
       }
     };
+    initApp();
+  }, []);
 
-    void checkSystemReady();
-  }, [fetchAnalytics]);
+  // 60fps Waveform Visualizer Loop
+  const updateVisualizer = useCallback(() => {
+    const data = getFrequencyData();
+    if (data) {
+      setVisualizerData(new Uint8Array(data));
+    }
+    animationFrameRef.current = requestAnimationFrame(updateVisualizer);
+  }, [getFrequencyData]);
 
-  const activeError = wsError || audioError;
+  useEffect(() => {
+    if (isRecording) {
+      animationFrameRef.current = requestAnimationFrame(updateVisualizer);
+    } else if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      setVisualizerData(null);
+    }
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [isRecording, updateVisualizer]);
+
+  // Handle Browser AI Call Start
+  const handleStartBrowserCall = async () => {
+    const newCallId = `call_${crypto.randomUUID()}`;
+    setActiveCallId(newCallId);
+    connectWebSocket(
+      newCallId,
+      businessProfile?.business_id || 'default_business'
+    );
+    await startRecording();
+  };
+
+  // Handle Browser AI Call End
+  const handleEndBrowserCall = () => {
+    stopRecording();
+    disconnectWebSocket();
+    setActiveCallId(null);
+  };
+
+  // Callback when Outbound PSTN Call is dispatched
+  const handlePstnCallInitiated = (callId: string, twilioSid: string) => {
+    setActiveCallId(callId);
+  };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col selection:bg-indigo-500 selection:text-white">
-      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-linear-to-tr from-indigo-600 to-emerald-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-              <PhoneCall className="w-5 h-5 text-white" />
-            </div>
-            <div>
-              <span className="text-base font-extrabold tracking-tight bg-linear-to-r from-white via-slate-200 to-indigo-400 bg-clip-text text-transparent">
-                VocalSync-AI
-              </span>
-              <span className="block text-[10px] font-medium uppercase tracking-wider text-slate-400">
-                Enterprise AI Voice Sales Console
-              </span>
-            </div>
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+      {/* TOP EXECUTIVE NAVIGATION BAR */}
+      <header className="border-b border-slate-800 bg-slate-900/90 backdrop-blur-md sticky top-0 z-40 px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-600 font-bold text-white shadow-lg shadow-indigo-600/30">
+            VS
           </div>
+          <div>
+            <h1 className="text-lg font-bold tracking-tight text-white">
+              VocalSync-AI Enterprise
+            </h1>
+            <p className="text-xs text-slate-400">
+              Autonomous Sales Qualification & Telephony Calling Console
+            </p>
+          </div>
+        </div>
 
-          <div className="flex items-center gap-4">
-            <div className="hidden md:flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-slate-800/80 border border-slate-700 text-slate-300">
-              <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" />
-              <span>OWASP LLM & API Guardrails Active</span>
-            </div>
+        <div className="flex items-center gap-4">
+          {/* Active Knowledge Base Badge */}
+          <button
+            onClick={() => setIsKbModalOpen(true)}
+            className="flex items-center gap-2 rounded-lg bg-slate-800 border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-750 hover:text-white transition-all"
+          >
+            <span>🏢 Active KB:</span>
+            <span className="font-semibold text-indigo-400">
+              {businessProfile?.company_name || 'VocalSync-AI Default'}
+            </span>
+            <span className="text-slate-500">⚙️</span>
+          </button>
 
-            <div className="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-slate-900 border border-slate-800">
-              {isBackendHealthy === true ? (
-                <>
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                  <span className="text-emerald-400">System Online</span>
-                </>
-              ) : isBackendHealthy === false ? (
-                <>
-                  <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
-                  <span className="text-rose-400">Backend Offline</span>
-                </>
-              ) : (
-                <>
-                  <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" />
-                  <span className="text-amber-400">Connecting...</span>
-                </>
-              )}
-            </div>
+          {/* System Health Indicator */}
+          <div className="flex items-center gap-2 rounded-full bg-slate-900 border border-slate-800 px-3 py-1 text-xs font-semibold">
+            <span
+              className={`h-2.5 w-2.5 rounded-full ${
+                systemHealth?.status === 'online'
+                  ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50 animate-pulse'
+                  : 'bg-amber-500'
+              }`}
+            />
+            <span className="text-slate-300 uppercase">
+              {systemHealth?.status || 'Connecting...'}
+            </span>
           </div>
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-          <div className="lg:col-span-7 xl:col-span-8 space-y-6">
-            <section className="space-y-2">
-              <div className="flex items-center justify-between">
-                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-emerald-400" />
-                  Real-Time Voice Waveform
-                </h2>
-                {callId && (
-                  <span className="text-xs font-mono text-slate-500">
-                    Session: {callId}
-                  </span>
-                )}
-              </div>
-              <AudioVisualizer
-                getFrequencyData={getFrequencyData}
-                isRecording={isRecording}
-                agentState={agentState}
-              />
-            </section>
+      {/* ERROR BANNER */}
+      {(wsError || micError) && (
+        <div className="bg-red-950/80 border-b border-red-800 px-6 py-2.5 text-xs font-medium text-red-200 flex items-center justify-between">
+          <span>⚠️ {wsError || micError}</span>
+          <button
+            onClick={() => window.location.reload()}
+            className="underline hover:text-white font-semibold"
+          >
+            Reload Page
+          </button>
+        </div>
+      )}
 
-            <section>
-              <CallControls
-                isConnected={isConnected}
-                isRecording={isRecording}
-                agentState={agentState}
-                onStartCall={handleStartCall}
-                onEndCall={handleEndCall}
-                errorMessage={activeError}
-              />
-            </section>
-
-            <section className="space-y-2">
-              <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-indigo-400" />
-                Live Conversation & Sentiment
-              </h2>
-              <TranscriptFeed
-                transcripts={transcripts}
-                latestToken={latestToken}
-              />
-            </section>
+      {/* MAIN CONSOLE DASHBOARD */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* LEFT COLUMN: LIVE VOICE CONTROLS & TRANSCRIPTS (7 Cols) */}
+        <div className="lg:col-span-7 flex flex-col gap-6">
+          {/* Mode Switching Tabs (Browser vs PSTN Phone) */}
+          <div className="flex rounded-xl bg-slate-900 border border-slate-800 p-1">
+            <button
+              onClick={() => setCallMode('browser')}
+              className={`flex-1 rounded-lg py-2 text-xs font-semibold uppercase tracking-wider transition-all ${
+                callMode === 'browser'
+                  ? 'bg-indigo-600 text-white shadow-md'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              💻 Local Browser Mic Call
+            </button>
+            <button
+              onClick={() => setCallMode('pstn')}
+              className={`flex-1 rounded-lg py-2 text-xs font-semibold uppercase tracking-wider transition-all ${
+                callMode === 'pstn'
+                  ? 'bg-indigo-600 text-white shadow-md'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              📞 Outbound PSTN Phone Call
+            </button>
           </div>
 
-          <div className="lg:col-span-5 xl:col-span-4 space-y-6">
-            <section className="space-y-2">
-              <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">
-                Live Lead Qualification
-              </h2>
-              <LeadAnalyticsCard lead={qualifiedLead} />
-            </section>
-
-            <section className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-lg">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                <div className="flex items-center gap-2">
-                  <BarChart3 className="w-5 h-5 text-indigo-400" />
-                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-200">
-                    Executive Analytics
+          {/* CALL TRIGGER SECTION */}
+          {callMode === 'browser' ? (
+            <div className="rounded-2xl bg-slate-900 border border-slate-800 p-5 shadow-lg flex flex-col gap-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                    Live Browser Voice Session
                   </h3>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Sub-second Llama-3.3-70B voice conversation over browser audio
+                  </p>
                 </div>
-                <button
-                  onClick={fetchAnalytics}
-                  disabled={isRefreshingAnalytics}
-                  className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 transition-colors disabled:opacity-50 cursor-pointer"
-                  title="Refresh KPI metrics"
-                >
-                  <RefreshCw
-                    className={`w-3.5 h-3.5 ${
-                      isRefreshingAnalytics
-                        ? "animate-spin text-indigo-400"
-                        : ""
-                    }`}
-                  />
-                </button>
+                <CallControls
+                  isRecording={isRecording}
+                  agentStatus={agentStatus}
+                  onStartCall={handleStartBrowserCall}
+                  onEndCall={handleEndBrowserCall}
+                />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block">
-                    Total Calls
-                  </span>
-                  <span className="text-xl font-black text-slate-100 mt-1 block">
-                    {analytics?.total_calls ?? 0}
-                  </span>
-                </div>
-
-                <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block">
-                    Qualified Leads
-                  </span>
-                  <span className="text-xl font-black text-emerald-400 mt-1 block">
-                    {analytics?.qualified_leads ?? 0}
-                  </span>
-                </div>
-
-                <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block">
-                    Avg Call Time
-                  </span>
-                  <span className="text-xl font-black text-slate-100 mt-1 block">
-                    {analytics?.avg_call_duration_seconds ?? 0}s
-                  </span>
-                </div>
-
-                <div className="p-3 rounded-xl bg-slate-950/60 border border-slate-800">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 block">
-                    Conversion Rate
-                  </span>
-                  <span className="text-xl font-black text-indigo-400 mt-1 block">
-                    {analytics?.conversion_rate_percent ?? 0}%
-                  </span>
-                </div>
+              {/* Waveform Visualizer */}
+              <div className="h-24 w-full rounded-xl bg-slate-950/80 border border-slate-800 overflow-hidden">
+                <AudioVisualizer
+                  data={visualizerData}
+                  isRecording={isRecording}
+                  agentStatus={agentStatus}
+                />
               </div>
+            </div>
+          ) : (
+            <OutboundDialerCard
+              businessId={businessProfile?.business_id || 'default_business'}
+              onCallInitiated={handlePstnCallInitiated}
+            />
+          )}
 
-              <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-500">
-                <span>Warm CRM Pipeline:</span>
-                <span className="font-semibold text-slate-300">
-                  {analytics?.warm_leads ?? 0} Leads
-                </span>
-              </div>
-            </section>
+          {/* REAL-TIME DIALOGUE & SENTIMENT FEED */}
+          <div className="flex-1 min-h-[380px] flex flex-col">
+            <TranscriptFeed
+              transcripts={transcripts}
+              agentStatus={agentStatus}
+              activeCallId={activeCallId}
+            />
+          </div>
+        </div>
+
+        {/* RIGHT COLUMN: AUTONOMOUS CRM BANT LEAD SCORECARD (5 Cols) */}
+        <div className="lg:col-span-5 flex flex-col gap-6">
+          <LeadAnalyticsCard liveLead={liveLead} />
+
+          {/* QUICK HELP / TESTING TIPS */}
+          <div className="rounded-2xl bg-slate-900/60 border border-slate-800/80 p-5 text-xs text-slate-400 space-y-2">
+            <h4 className="font-semibold text-slate-200 text-sm">
+              💡 Sales Test Scenarios
+            </h4>
+            <p>
+              • <strong className="text-slate-300">Test Budget:</strong> Mention
+              your budget (e.g., <em>"We have around $30,000 for this"</em>) to
+              watch the CRM score increase.
+            </p>
+            <p>
+              • <strong className="text-slate-300">Test Objections:</strong> Say{' '}
+              <em>"Your price is too expensive"</em> to test Llama-3.3's
+              objection handling and watch the objection badge trigger.
+            </p>
+            <p>
+              • <strong className="text-slate-300">Test Silence:</strong> Notice
+              how your RMS VAD noise gate prevents Whisper from hallucinating
+              words when you stay quiet.
+            </p>
           </div>
         </div>
       </main>
 
-      <footer className="border-t border-slate-800/80 bg-slate-900/30 py-4 mt-auto">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-          <p>
-            Powered by Groq Whisper Turbo, Llama-3.3-70B, Edge-TTS, and MongoDB
-            Atlas.
-          </p>
-          <p className="font-mono">100% Free Open-Source Infrastructure</p>
-        </div>
-      </footer>
+      {/* KNOWLEDGE BASE MODAL */}
+      <BusinessConfigModal
+        isOpen={isKbModalOpen}
+        onClose={() => setIsKbModalOpen(false)}
+        onSaveSuccess={(savedProfile) => setBusinessProfile(savedProfile)}
+        currentProfile={businessProfile}
+      />
     </div>
   );
 };
-
-export default App;
