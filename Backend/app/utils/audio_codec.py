@@ -6,7 +6,7 @@ from typing import Tuple
 
 # Use audioop-lts for Python 3.13+ compatibility while retaining backward compatibility
 try:
-    import audioop_lts as audioop
+    import audioop_lts as audioop # type: ignore
 except ImportError:
     import audioop
 
